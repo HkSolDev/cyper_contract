@@ -17,24 +17,22 @@ pub mod cyper_v0 {
     pub fn create_market(
         ctx: Context<CreateMarket>,
         question_text: String,
-        fixed_price: u64,
         market_type: MarketType,
         category: MarketCategory,
         lp_fee_bps: Option<u16>,
         resolution_deadline: i64,
         market_group: Option<Pubkey>,
-        market_data: MarketData,
+        resolution_strategy: ResolutionStrategy,
     ) -> Result<()> {
         create_market_handler(
             ctx,
             question_text,
-            fixed_price,
             market_type,
             category,
             lp_fee_bps,
             resolution_deadline,
             market_group,
-            market_data,
+            resolution_strategy,
         )
     }
 
@@ -56,6 +54,10 @@ pub mod cyper_v0 {
 
     pub fn set_accuracy_payout(ctx: Context<SetAccuracyPayout>, amount: u64) -> Result<()> {
         set_accuracy_payout_handler(ctx, amount)
+    }
+
+    pub fn finalize_market(ctx: Context<FinalizeMarket>) -> Result<()> {
+        finalize_market_handler(ctx)
     }
 }
 
@@ -80,7 +82,7 @@ pub struct Claim<'info> {
         bump = market.bump,
         constraint = market.status == MarketStatus::Settled || market.status == MarketStatus::Voided @ ErrorCode::MarketNotSettled
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     #[account(address = market.token_mint @ ErrorCode::InvalidMint)]
     pub mint: InterfaceAccount<'info, Mint>,
@@ -117,7 +119,7 @@ pub struct SetAccuracyPayout<'info> {
         bump = market.bump,
         has_one = creator @ ErrorCode::UnauthorizedAction,
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     #[account(
         mut,
@@ -207,6 +209,8 @@ pub struct Market {
     pub total_liquidity: u64,
     pub market_data: MarketData,
     pub winning_outcome: Option<WinningOutcome>,
+    pub resolution_strategy: ResolutionStrategy,
+    pub dispute_end_time: Option<i64>,
 }
 
 
@@ -229,7 +233,7 @@ pub struct CreateMarket<'info> {
         seeds = [b"market", cyper_market.market_count.to_le_bytes().as_ref()],
         bump,
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     pub mint: InterfaceAccount<'info, Mint>,
 
@@ -260,13 +264,12 @@ pub struct CreateMarket<'info> {
 pub fn create_market_handler(
     ctx: Context<CreateMarket>,
     question_text: String,
-    _fixed_price: u64,
     market_type: MarketType,
     category: MarketCategory,
     lp_fee_bps: Option<u16>,
     resolution_deadline: i64,
     market_group: Option<Pubkey>,
-    market_data: MarketData,
+    resolution_strategy: ResolutionStrategy,
 ) -> Result<()> {
 
     require!(question_text.len() <= 200, ErrorCode::QuestionTooLong);
@@ -287,9 +290,14 @@ pub fn create_market_handler(
         MarketType::YesNo => MarketData::YesNo { yes_pool: 0, no_pool: 0 },
         MarketType::MultiOutcome { outcome_count } => {
             require!(outcome_count >= 2 && outcome_count <= 10, ErrorCode::InvalidPrice);
-            MarketData::MultiOutcome { pools: vec![0; outcome_count as usize] }
+            // FIXED: Using fixed array to avoid heap allocation overhead
+            MarketData::MultiOutcome { pools: [0; 10] } 
         },
-        MarketType::Accuracy { .. } => MarketData::Accuracy { total_pool: 0 },
+        MarketType::Accuracy { .. } => MarketData::Accuracy { 
+            prediction_histogram: [0; 100],
+            median_error: None,
+            total_winning_weight: None,
+        },
     };
 
     if new_market.creator == cyper_market.authority {
@@ -298,12 +306,9 @@ pub fn create_market_handler(
         new_market.creator_bond = cyper_market.default_creator_bond;
     }
 
-    // Enforce economic rules based on the market type
+    // FIXED: Added the missing `match` keyword here
     match market_type {
-        MarketType::Accuracy { fixed_price: _ } => {
-            // Accuracy markets use parimutuel entry fees, NOT liquidity pools.
-            require!(lp_fee_bps.unwrap_or(0) == 0, ErrorCode::NoLpsInAccuracyMarkets);
-        },
+        MarketType::Accuracy { .. } => {},
         MarketType::YesNo | MarketType::MultiOutcome { .. } => {
             // Standard AMM markets require an LP fee to incentivize liquidity providers
             require!(lp_fee_bps.unwrap_or(0) > 0, ErrorCode::LpFeeRequired);
@@ -315,7 +320,7 @@ pub fn create_market_handler(
     
     // Set protocol fee: Admin full fee go to treasury, everyone else pays half fee
     if new_market.creator == cyper_market.authority {
-        new_market.protocol_fee_bps = cyper_market.default_protocol_fee_bps
+        new_market.protocol_fee_bps = cyper_market.default_protocol_fee_bps;
     } else {
         new_market.protocol_fee_bps = cyper_market.default_protocol_fee_bps.checked_div(2).unwrap_or(0);
     }
@@ -326,8 +331,9 @@ pub fn create_market_handler(
    
     new_market.token_mint = ctx.accounts.mint.key();
     new_market.market_group = market_group;
-    new_market.market_data = market_data;
     new_market.user_bet_index = 0;
+    new_market.resolution_strategy = resolution_strategy;
+    new_market.dispute_end_time = None;
 
     // CPI: Transfer creator bond
     if new_market.creator_bond > 0 {
@@ -376,7 +382,7 @@ pub struct PlaceBet<'info> {
     ],
     bump=market.bump
     )]
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
 
     #[account(init,
     payer = better,
@@ -414,8 +420,8 @@ pub fn place_bet_handler(ctx: Context<PlaceBet>, amount: u64, bet_data: BetData)
     require!(Clock::get()?.unix_timestamp < market.resolution_deadline, ErrorCode::InvalidBettingWindow);
 
     match (&market.market_type, &bet_data) {
-        (MarketType::Accuracy { fixed_price }, BetData::Accuracy { predicted_value: _ }) => {
-            require!(amount == *fixed_price, ErrorCode::InvalidBetAmount);
+        (MarketType::Accuracy { entry_fee, .. }, BetData::Accuracy { predicted_value: _ }) => {
+            require!(amount == *entry_fee, ErrorCode::InvalidBetAmount);
         },
         (MarketType::YesNo, BetData::YesNo { direction: _ }) => {
             require!(amount > 0, ErrorCode::InvalidBetAmount);
@@ -443,8 +449,10 @@ pub fn place_bet_handler(ctx: Context<PlaceBet>, amount: u64, bet_data: BetData)
     market.total_liquidity = market.total_liquidity.checked_add(amount).ok_or(ErrorCode::MarketCountOverflow)?;
 
     match (&mut market.market_data, &bet.bet_data) {
-        (MarketData::Accuracy { total_pool }, BetData::Accuracy { .. }) => {
-            *total_pool = total_pool.checked_add(amount).ok_or(ErrorCode::MarketCountOverflow)?;
+        (MarketData::Accuracy { prediction_histogram, .. }, BetData::Accuracy { predicted_value }) => {
+            let bucket = *predicted_value as usize;
+            require!(bucket < 100, ErrorCode::InvalidBucket);
+            prediction_histogram[bucket] = prediction_histogram[bucket].checked_add(1).ok_or(ErrorCode::MathOverflow)?;
         },
         (MarketData::YesNo { yes_pool, no_pool }, BetData::YesNo { direction }) => {
             if *direction {
@@ -474,6 +482,213 @@ pub fn place_bet_handler(ctx: Context<PlaceBet>, amount: u64, bet_data: BetData)
     Ok(())
 }
 
+pub fn set_accuracy_payout_handler(ctx: Context<SetAccuracyPayout>, amount: u64) -> Result<()> {
+    let market = &ctx.accounts.market;
+    let bet = &mut ctx.accounts.bet;
+
+    require!(market.status == MarketStatus::Settled, ErrorCode::MarketNotSettled);
+    require!(matches!(market.market_type, MarketType::Accuracy { .. }), ErrorCode::MarketTypeMismatch);
+
+    bet.payout_amount = Some(amount);
+    Ok(())
+}
+
+
+
+
+
+
+#[derive(Accounts)]
+pub struct LockMarket<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"market", market.market_index.to_le_bytes().as_ref()],
+        bump = market.bump,
+        has_one = creator @ ErrorCode::UnauthorizedAction 
+    )]
+    pub market: Box<Account<'info, Market>>,
+}
+
+
+pub fn lock_market_handler(ctx: Context<LockMarket>) -> Result<()> {
+    let market = &mut ctx.accounts.market;
+
+    // Ensure the market is currently open
+    require!(market.status == MarketStatus::Open, ErrorCode::MarketNotOpen);
+
+    // Ensure the resolution deadline has actually passed
+    let current_time = Clock::get()?.unix_timestamp;
+    require!(current_time >= market.resolution_deadline, ErrorCode::ResolutionTooEarly);
+
+    // Update the status
+    market.status = MarketStatus::Locked;
+
+    msg!("Market {} is now Locked. No more bets can be placed!", market.market_index);
+    Ok(())
+}
+
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, InitSpace)]
+pub enum BetData {
+    // Stores the user's prediction value
+    Accuracy { predicted_value: u64 }, 
+    // Stores true for "Yes", false for "No"
+    YesNo { direction: bool },         
+    // Stores the index of the outcome they are betting on
+    MultiOutcome { outcome_index: u8 }, 
+}
+
+#[derive(Accounts)]
+pub struct SettleMarket<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"market", market.market_index.to_le_bytes().as_ref()],
+        bump = market.bump,
+        has_one = creator @ ErrorCode::UnauthorizedAction
+    )]
+    pub market: Box<Account<'info, Market>>,
+
+   /// CHECK: Optional oracle account feed (Pyth/Switchboard).
+    pub oracle_account: Option<UncheckedAccount<'info>>,
+}
+
+pub fn settle_market_handler(ctx: Context<SettleMarket>, proposed_outcome: WinningOutcome) -> Result<()> {
+    let market = &mut ctx.accounts.market;
+
+    // 1. STATE CHECK: Market must be locked
+    require!(market.status == MarketStatus::Locked, ErrorCode::MarketNotLocked);
+
+    
+
+    // 2. TYPE SECURITY: Ensure proposed outcome type matches market type
+    match (&market.market_type, &proposed_outcome) {
+        (MarketType::Accuracy { .. }, WinningOutcome::Accuracy { .. }) => {},
+        (MarketType::YesNo, WinningOutcome::YesNo { .. }) => {},
+        (MarketType::MultiOutcome{..}, WinningOutcome::MultiOutcome { .. }) => {},
+        _ => return Err(ErrorCode::MarketTypeMismatch.into()),
+    }
+
+    // 3. CAPTURE THE TRUTH: Route based on how this specific market resolves
+    match market.resolution_strategy {
+        ResolutionStrategy::OnChainOracle { feed_address } => {
+            let oracle = ctx.accounts.oracle_account.as_ref().ok_or(ErrorCode::MissingOracleAccount)?;
+            require_keys_eq!(oracle.key(), feed_address, ErrorCode::InvalidOracleAccount);
+            
+            let oracle_data = oracle.try_borrow_data()?;
+            require!(oracle_data.len() >= 81, ErrorCode::InvalidOracleAccount);
+
+            // Get histogram bounds from MarketType
+            let price_bytes: [u8; 8] = oracle_data[73..81].try_into().unwrap();
+            let raw_price = i64::from_le_bytes(price_bytes);
+
+            let (min_price, max_price) = if let MarketType::Accuracy { min_price, max_price, .. } = market.market_type {
+                (min_price, max_price)
+            } else {
+                return Err(ErrorCode::MarketTypeMismatch.into());
+            };
+
+            let actual_bucket = price_to_bucket(raw_price, min_price, max_price);
+            let target_median_count = market.total_bets / 2;
+
+            // 5. EXECUTE HISTOGRAM MATH (Median Error & Convex Weights)
+            if let MarketData::Accuracy { 
+                prediction_histogram, 
+                ref mut median_error, 
+                ref mut total_winning_weight 
+            } = market.market_data {
+                let mut error_hist = [0u32; 100];
+                for i in 0..100 {
+                    let count = prediction_histogram[i];
+                    if count > 0 {
+                        let error = (i as i32 - actual_bucket as i32).abs() as usize;
+                        if error < 100 {
+                            error_hist[error] += count;
+                        }
+                    }
+                }
+                
+                let mut cumulative_count = 0;
+                let mut calculated_median_error = 0;
+                for e in 0..100 {
+                    cumulative_count += error_hist[e] as u64;
+                    if cumulative_count > target_median_count {
+                        calculated_median_error = e as u8;
+                        break;
+                    }
+                }
+                *median_error = Some(calculated_median_error);
+
+                let mut total_weight: u128 = 0;
+                for i in 0..100 {
+                    let count = prediction_histogram[i];
+                    if count > 0 {
+                        let error = (i as i32 - actual_bucket as i32).abs() as u8;
+                        if error < calculated_median_error {
+                            let weight_per_bet = ((calculated_median_error - error) as u128).pow(2);
+                            total_weight += weight_per_bet * (count as u128);
+                        } else if calculated_median_error == 0 && error == 0 {
+                            total_weight += count as u128;
+                        }
+                    }
+                }
+                *total_winning_weight = Some(total_weight);
+            }
+
+            market.winning_outcome = Some(WinningOutcome::Accuracy { actual_value: actual_bucket });
+            market.status = MarketStatus::Settled;
+            msg!("Accuracy market settled securely via On-Chain Oracle!");
+        },
+        
+        ResolutionStrategy::Optimistic { dispute_window_seconds } => {
+            market.winning_outcome = Some(proposed_outcome);
+            market.status = MarketStatus::InDispute;
+            market.dispute_end_time = Some(Clock::get()?.unix_timestamp.checked_add(dispute_window_seconds as i64).ok_or(ErrorCode::MathOverflow)?);
+            msg!("Outcome proposed. Dispute window open!");
+        },
+        
+        ResolutionStrategy::Committee { committee_pubkey } => {
+            require_keys_eq!(ctx.accounts.creator.key(), committee_pubkey, ErrorCode::UnauthorizedAction);
+            market.winning_outcome = Some(proposed_outcome);
+            market.status = MarketStatus::Settled;
+            msg!("Market settled securely via Committee consensus!");
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct FinalizeMarket<'info> {
+    #[account(
+        mut,
+        seeds = [b"market", market.market_index.to_le_bytes().as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, Market>>,
+}
+
+pub fn finalize_market_handler(ctx: Context<FinalizeMarket>) -> Result<()> {
+    let market = &mut ctx.accounts.market;
+
+    require!(market.status == MarketStatus::InDispute, ErrorCode::MarketNotInDispute);
+
+    let current_time = Clock::get()?.unix_timestamp;
+    let dispute_end = market.dispute_end_time.ok_or(ErrorCode::DisputeTimeNotSet)?;
+
+    require!(current_time >= dispute_end, ErrorCode::DisputeWindowNotClosed);
+
+    market.status = MarketStatus::Settled;
+    msg!("Dispute window closed. Market {} successfully finalized!", market.market_index);
+    Ok(())
+}
+
+
 pub fn claim_handler(ctx: Context<Claim>) -> Result<()> {
     let market = &mut ctx.accounts.market;
     let bet = &mut ctx.accounts.bet;
@@ -492,10 +707,32 @@ pub fn claim_handler(ctx: Context<Claim>) -> Result<()> {
 
         // 3. PARIMUTUEL MATH & PAYOUT ROUTER
         match (&market.market_type, winning_outcome, &bet.bet_data) {
-            // A. ACCURACY MARKETS (TREPA MODEL)
-            (MarketType::Accuracy { .. }, WinningOutcome::Accuracy { .. }, BetData::Accuracy { .. }) => {
-                // Payout was calculated off-chain and injected by the crank
-                payout = bet.payout_amount.ok_or(ErrorCode::PayoutNotSet)?; 
+            // A. ACCURACY MARKETS (HISTOGRAM MODEL)
+            (MarketType::Accuracy { .. }, WinningOutcome::Accuracy { actual_value }, BetData::Accuracy { predicted_value }) => {
+                if let MarketData::Accuracy { median_error, total_winning_weight, .. } = market.market_data {
+                    let med_err = median_error.ok_or(ErrorCode::MarketNotSettled)?;
+                    let tot_weight = total_winning_weight.ok_or(ErrorCode::MarketNotSettled)?;
+                    
+                    let my_error = (*predicted_value as i32 - *actual_value as i32).abs() as u8;
+                    
+                    if my_error < med_err || (med_err == 0 && my_error == 0) {
+                        let my_weight = if med_err == 0 {
+                            1u128
+                        } else {
+                            ((med_err - my_error) as u128).pow(2)
+                        };
+
+                        if tot_weight > 0 {
+                            payout = (my_weight)
+                                .checked_mul(market.total_liquidity as u128)
+                                .ok_or(ErrorCode::MathOverflow)?
+                                .checked_div(tot_weight)
+                                .ok_or(ErrorCode::MathOverflow)? as u64;
+                        }
+                    }
+                } else {
+                    return Err(ErrorCode::MarketTypeMismatch.into());
+                }
             },
             
             // B. YES/NO BINARY MARKETS
@@ -578,107 +815,16 @@ pub fn claim_handler(ctx: Context<Claim>) -> Result<()> {
     Ok(())
 }
 
-pub fn set_accuracy_payout_handler(ctx: Context<SetAccuracyPayout>, amount: u64) -> Result<()> {
-    let market = &ctx.accounts.market;
-    let bet = &mut ctx.accounts.bet;
-
-    require!(market.status == MarketStatus::Settled, ErrorCode::MarketNotSettled);
-    require!(matches!(market.market_type, MarketType::Accuracy { .. }), ErrorCode::MarketTypeMismatch);
-
-    bet.payout_amount = Some(amount);
-    Ok(())
-}
-
-
-
-
-
-
-#[derive(Accounts)]
-pub struct LockMarket<'info> {
-    #[account(mut)]
-    pub creator: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"market", market.market_index.to_le_bytes().as_ref()],
-        bump = market.bump,
-        has_one = creator @ ErrorCode::UnauthorizedAction 
-    )]
-    pub market: Account<'info, Market>,
-}
-
-
-pub fn lock_market_handler(ctx: Context<LockMarket>) -> Result<()> {
-    let market = &mut ctx.accounts.market;
-
-    // Ensure the market is currently open
-    require!(market.status == MarketStatus::Open, ErrorCode::MarketNotOpen);
-
-    // Ensure the resolution deadline has actually passed
-    let current_time = Clock::get()?.unix_timestamp;
-    require!(current_time >= market.resolution_deadline, ErrorCode::ResolutionTooEarly);
-
-    // Update the status
-    market.status = MarketStatus::Locked;
-
-    msg!("Market {} is now Locked. No more bets can be placed!", market.market_index);
-    Ok(())
-}
-
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, InitSpace)]
-pub enum BetData {
-    // Stores the user's prediction value
-    Accuracy { predicted_value: u64 }, 
-    // Stores true for "Yes", false for "No"
-    YesNo { direction: bool },         
-    // Stores the index of the outcome they are betting on
-    MultiOutcome { outcome_index: u8 }, 
-}
-
-#[derive(Accounts)]
-pub struct SettleMarket<'info> {
-    #[account(mut)]
-    pub creator: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"market", market.market_index.to_le_bytes().as_ref()],
-        bump = market.bump,
-        has_one = creator @ ErrorCode::UnauthorizedAction
-    )]
-    pub market: Account<'info, Market>,
-}
-
-pub fn settle_market_handler(ctx: Context<SettleMarket>, outcome: WinningOutcome) -> Result<()> {
-    let market = &mut ctx.accounts.market;
-
-    // 1. STATE CHECK: Market must be locked before settlement
-    require!(market.status == MarketStatus::Locked, ErrorCode::MarketNotLocked);
-
-    // 2. SECURITY CHECK: Ensure outcome type matches market type
-    match (&market.market_type, &outcome) {
-        (MarketType::Accuracy { .. }, WinningOutcome::Accuracy { .. }) => {},
-        (MarketType::YesNo, WinningOutcome::YesNo { .. }) => {},
-        (MarketType::MultiOutcome{..}, WinningOutcome::MultiOutcome { .. }) => {},
-        _ => return Err(ErrorCode::MarketTypeMismatch.into()),
-    }
-
-    // 3. EFFECT: Store the outcome and update status
-    market.winning_outcome = Some(outcome);
-    market.status = MarketStatus::Settled;
-
-    msg!("Market {} successfully settled!", market.market_index);
-    Ok(())
-}
-
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
 pub enum MarketType {
     YesNo,
     MultiOutcome { outcome_count: u8 },
-    Accuracy { fixed_price: u64 },
+    Accuracy { 
+        entry_fee: u64,
+        min_price: i64,
+        max_price: i64,
+    },
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -698,6 +844,14 @@ pub enum MarketStatus {
     Locked,
     Settled,
     Voided,
+    InDispute,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, InitSpace)]
+pub enum ResolutionStrategy {
+    OnChainOracle { feed_address: Pubkey },
+    Optimistic { dispute_window_seconds: i64 },
+    Committee { committee_pubkey: Pubkey },
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, InitSpace)]
@@ -707,18 +861,20 @@ pub enum MarketData {
         no_pool: u64 
     },
     MultiOutcome { 
-        #[max_len(10)]
-        pools: Vec<u64> 
+     pools: [u64; 10] 
     },
     Accuracy { 
-        total_pool: u64 
+        // 1. The live betting state (Fast O(1) tracking)
+        prediction_histogram: [u32; 100], 
+        median_error: Option<u8>,
+        total_winning_weight: Option<u128>, 
     },
 }
 
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, InitSpace)]
 pub enum WinningOutcome {
-    Accuracy { actual_value: u64 },
+    Accuracy { actual_value: u8 },
     YesNo { winning_direction: bool },
     MultiOutcome { winning_index: u8 },
 }
@@ -783,4 +939,25 @@ pub enum ErrorCode {
     MathOverflow,
     #[msg("Nothing to claim for this bet.")]
     NothingToClaim,
+    #[msg("Market not in dispute")]
+    MarketNotInDispute,
+    #[msg("Dispute time not set")]
+    DisputeTimeNotSet,
+    #[msg("Dispute window not closed")]
+    DisputeWindowNotClosed,
+    #[msg("Missing oracle account for this market")]
+    MissingOracleAccount,
+    #[msg("Invalid oracle account passed")]
+    InvalidOracleAccount,
+    #[msg("Invalid bucket index")]
+    InvalidBucket,
+}
+
+pub fn price_to_bucket(price: i64, min: i64, max: i64) -> u8 {
+    let buckets: f64 = 100.0;
+    if price <= min { return 0; }
+    if price >= max { return 99; }
+    let range = (max - min) as f64;
+    let pos = (price - min) as f64;
+    ((pos / range) * buckets) as u8
 }

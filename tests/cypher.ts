@@ -112,7 +112,8 @@ describe("cyper_v0", () => {
         50,              // lp_fee_bps
         deadline,
         null,            // market_group
-        { yesNo: { yesPool: new anchor.BN(0), noPool: new anchor.BN(0) } } // market_data
+        { yesNo: { yesPool: new anchor.BN(0), noPool: new anchor.BN(0) } }, // market_data
+        { optimistic: { disputeWindowSeconds: new anchor.BN(86400) } } // resolution_strategy
       )
       .accounts({
         marketAuthority: admin.publicKey,
@@ -208,7 +209,8 @@ describe("cyper_v0", () => {
         null,                                     // lp_fee_bps must be null/0 for accuracy
         deadline,
         null,                                     // market_group
-        { accuracy: { totalPool: new anchor.BN(0) } } // market_data
+        { accuracy: { totalPool: new anchor.BN(0) } }, // market_data
+        { onChainOracle: { feedAddress: SystemProgram.programId } } // resolution_strategy
       )
       .accounts({
         marketAuthority: admin.publicKey,
