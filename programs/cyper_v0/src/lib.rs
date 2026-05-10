@@ -59,6 +59,14 @@ pub mod cyper_v0 {
     pub fn finalize_market(ctx: Context<FinalizeMarket>) -> Result<()> {
         finalize_market_handler(ctx)
     }
+
+    // pub fn withdraw_creator(ctx: Context<WithdrawCreator>) -> Result<()> {
+    //     withdraw_creator_handler(ctx)
+    // }
+
+    // pub fn void_market(ctx: Context<VoidMarket>) -> Result<()> {
+    //     void_market_handler(ctx)
+    // }
 }
 
 #[derive(Accounts)]
@@ -137,6 +145,8 @@ pub struct CyperMarket {
     pub default_protocol_fee_bps: u16, // e.g. 50 = 0.50%
     pub default_creator_bond: u64,
     pub market_count: u64,
+    pub accumulated_protocol_fees: u64,
+    pub is_paused: bool,
 }
 
 #[derive(Accounts)]
@@ -180,6 +190,7 @@ pub fn initialize_handler(ctx: Context<Initialize>, fee: u16, creator_bond: u64)
     market.default_protocol_fee_bps = fee;
     market.default_creator_bond = creator_bond;
     market.market_count = 0;
+    market.is_paused = false;
     Ok(())
 }
 
@@ -207,6 +218,7 @@ pub struct Market {
     pub token_mint: Pubkey,
     pub market_group: Option<Pubkey>, // None for standalone, Some for tiered
     pub total_liquidity: u64,
+    pub accumulated_lp_fees: u64,
     pub market_data: MarketData,
     pub winning_outcome: Option<WinningOutcome>,
     pub resolution_strategy: ResolutionStrategy,
@@ -276,6 +288,8 @@ pub fn create_market_handler(
 
     let new_market = &mut ctx.accounts.market;
     let cyper_market = &mut ctx.accounts.cyper_market;
+
+    require!(!cyper_market.is_paused, ErrorCode::ProtocolPaused);
 
     new_market.creator = ctx.accounts.market_authority.key();
     new_market.market_index = cyper_market.market_count;
@@ -373,6 +387,13 @@ pub struct PlaceBet<'info> {
     #[account(mut)]
     pub better: Signer<'info>,
 
+    #[account(
+        mut,
+        seeds = [b"protocol"],
+        bump = cyper_market.bump
+    )]
+    pub cyper_market: Account<'info, CyperMarket>,
+
     #[account(address = market.token_mint @ErrorCode::InvalidMint)]
     pub mint: InterfaceAccount<'info, Mint>,
 
@@ -416,22 +437,57 @@ pub struct PlaceBet<'info> {
 pub fn place_bet_handler(ctx: Context<PlaceBet>, amount: u64, bet_data: BetData) -> Result<()> {
     let market = &mut ctx.accounts.market;
     
+    // We bring in the global state to track protocol revenue
+    let cyper_market = &mut ctx.accounts.cyper_market; 
+    
+    require!(!cyper_market.is_paused, ErrorCode::ProtocolPaused);
+
+    // 1. TIME & STATE SECURITY CHECKS
     require!(market.status == MarketStatus::Open, ErrorCode::MarketNotOpen);
     require!(Clock::get()?.unix_timestamp < market.resolution_deadline, ErrorCode::InvalidBettingWindow);
 
     match (&market.market_type, &bet_data) {
-        (MarketType::Accuracy { entry_fee, .. }, BetData::Accuracy { predicted_value: _ }) => {
+        (MarketType::Accuracy { entry_fee, .. }, BetData::Accuracy { .. }) => {
             require!(amount == *entry_fee, ErrorCode::InvalidBetAmount);
         },
-        (MarketType::YesNo, BetData::YesNo { direction: _ }) => {
+        (MarketType::YesNo, BetData::YesNo { .. }) => {
             require!(amount > 0, ErrorCode::InvalidBetAmount);
         },
-        (MarketType::MultiOutcome{outcome_count: _}, BetData::MultiOutcome { outcome_index: _ }) => {
+        (MarketType::MultiOutcome{..}, BetData::MultiOutcome { .. }) => {
             require!(amount > 0, ErrorCode::InvalidBetAmount);
         },
         _ => return Err(ErrorCode::MarketTypeMismatch.into()),
     }
 
+    // 2. GROSS-TO-NET FEE CALCULATION
+    // Math Rule: Always multiply before dividing to prevent precision loss on Solana
+    let protocol_fee_amount = amount
+        .checked_mul(market.protocol_fee_bps as u64)
+        .ok_or(ErrorCode::MathOverflow)?
+        .checked_div(10000)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    let lp_fee_amount = if let Some(lp_bps) = market.lp_fee_bps {
+        amount
+            .checked_mul(lp_bps as u64)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::MathOverflow)?
+    } else {
+        0
+    };
+
+    let total_fees = protocol_fee_amount.checked_add(lp_fee_amount).ok_or(ErrorCode::MathOverflow)?;
+    let net_amount = amount.checked_sub(total_fees).ok_or(ErrorCode::MathOverflow)?;
+
+    // 3. TRACK ACCUMULATED FEES (For the Withdraw Instructions later)
+    market.accumulated_lp_fees = market.accumulated_lp_fees
+        .checked_add(lp_fee_amount).ok_or(ErrorCode::MathOverflow)?;
+        
+    cyper_market.accumulated_protocol_fees = cyper_market.accumulated_protocol_fees
+        .checked_add(protocol_fee_amount).ok_or(ErrorCode::MathOverflow)?;
+
+    // 4. UPDATE BET STATE
     let bet = &mut ctx.accounts.bet;
     bet.bump = ctx.bumps.bet;
     bet.bettor = ctx.accounts.better.key();
@@ -439,14 +495,18 @@ pub fn place_bet_handler(ctx: Context<PlaceBet>, amount: u64, bet_data: BetData)
     bet.bet_index = market.user_bet_index;
     bet.created_at = Clock::get()?.unix_timestamp;
     bet.claimed = false;
-    bet.amount = amount;
-
     
-    
+    // SECURITY: Store the NET amount on the user's bet. 
+    // This prevents overpaying the user when calculating their share during the `claim` phase.
+    bet.amount = net_amount; 
     bet.bet_data = bet_data;
+
+    // 5. UPDATE MARKET LIQUIDITY (Using Net Amount!)
     market.user_bet_index = market.user_bet_index.checked_add(1).ok_or(ErrorCode::MarketCountOverflow)?;
     market.total_bets = market.total_bets.checked_add(1).ok_or(ErrorCode::MarketCountOverflow)?;
-    market.total_liquidity = market.total_liquidity.checked_add(amount).ok_or(ErrorCode::MarketCountOverflow)?;
+    
+    // The prize pool only grows by the net amount
+    market.total_liquidity = market.total_liquidity.checked_add(net_amount).ok_or(ErrorCode::MarketCountOverflow)?;
 
     match (&mut market.market_data, &bet.bet_data) {
         (MarketData::Accuracy { prediction_histogram, .. }, BetData::Accuracy { predicted_value }) => {
@@ -456,27 +516,30 @@ pub fn place_bet_handler(ctx: Context<PlaceBet>, amount: u64, bet_data: BetData)
         },
         (MarketData::YesNo { yes_pool, no_pool }, BetData::YesNo { direction }) => {
             if *direction {
-                *yes_pool = yes_pool.checked_add(amount).ok_or(ErrorCode::MarketCountOverflow)?;
+                *yes_pool = yes_pool.checked_add(net_amount).ok_or(ErrorCode::MarketCountOverflow)?;
             } else {
-                *no_pool = no_pool.checked_add(amount).ok_or(ErrorCode::MarketCountOverflow)?;
+                *no_pool = no_pool.checked_add(net_amount).ok_or(ErrorCode::MarketCountOverflow)?;
             }
         },
         (MarketData::MultiOutcome { pools }, BetData::MultiOutcome { outcome_index }) => {
             let idx = *outcome_index as usize;
             require!(idx < pools.len(), ErrorCode::MarketTypeMismatch);
-            pools[idx] = pools[idx].checked_add(amount).ok_or(ErrorCode::MarketCountOverflow)?;
+            pools[idx] = pools[idx].checked_add(net_amount).ok_or(ErrorCode::MarketCountOverflow)?;
         },
         _ => return Err(ErrorCode::MarketTypeMismatch.into()),
     }
 
+    // 6. TRANSFER GROSS AMOUNT
     let cpi_accounts = TransferChecked {
         from: ctx.accounts.better_vault.to_account_info(),
         to: ctx.accounts.market_vault.to_account_info(),
         mint: ctx.accounts.mint.to_account_info(),
         authority: ctx.accounts.better.to_account_info(), 
     }; 
-   
     let cpi_ctx = CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
+    
+    // We still transfer the GROSS `amount` from the user to the vault.
+    // Inside the vault, the math holds perfectly: Vault Balance = total_liquidity + accumulated_lp_fees + accumulated_protocol_fees
     token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.mint.decimals)?;
 
     Ok(())
@@ -951,6 +1014,12 @@ pub enum ErrorCode {
     InvalidOracleAccount,
     #[msg("Invalid bucket index")]
     InvalidBucket,
+    #[msg("Protocol is currently paused")]
+    ProtocolPaused,
+    #[msg("Invalid market vault")]
+    InvalidMarketVault,
+    #[msg("Market is not settled or voided")]
+    MarketNotSettledOrVoided,
 }
 
 pub fn price_to_bucket(price: i64, min: i64, max: i64) -> u8 {
