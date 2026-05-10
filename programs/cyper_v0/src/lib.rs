@@ -60,13 +60,13 @@ pub mod cyper_v0 {
         finalize_market_handler(ctx)
     }
 
-    // pub fn withdraw_creator(ctx: Context<WithdrawCreator>) -> Result<()> {
-    //     withdraw_creator_handler(ctx)
-    // }
+    pub fn withdraw_creator(ctx: Context<WithdrawCreator>) -> Result<()> {
+        withdraw_creator_handler(ctx)
+    }
 
-    // pub fn void_market(ctx: Context<VoidMarket>) -> Result<()> {
-    //     void_market_handler(ctx)
-    // }
+    pub fn void_market(ctx: Context<VoidMarket>) -> Result<()> {
+        void_market_handler(ctx)
+    }
 }
 
 #[derive(Accounts)]
@@ -878,6 +878,128 @@ pub fn claim_handler(ctx: Context<Claim>) -> Result<()> {
     Ok(())
 }
 
+pub fn withdraw_creator_handler(ctx: Context<WithdrawCreator>) -> Result<()> {
+    let market = &mut ctx.accounts.market;
+
+    // 1. STATE CHECK: Market must be fully finished (Settled or Voided)
+    require!(
+        market.status == MarketStatus::Settled || market.status == MarketStatus::Voided,
+        ErrorCode::MarketNotSettledOrVoided
+    );
+
+    // 2. CALCULATE TOTAL REVENUE
+    let total_withdrawal = market.creator_bond
+        .checked_add(market.accumulated_lp_fees)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    require!(total_withdrawal > 0, ErrorCode::NothingToClaim);
+
+    // 3. ZERO OUT BALANCES (CEI Pattern: Checks-Effects-Interactions)
+    // We set these to 0 BEFORE transferring to prevent reentrancy double-withdrawals
+    market.creator_bond = 0;
+    market.accumulated_lp_fees = 0;
+
+    // 4. PDA SIGNER SETUP
+    let market_index_bytes = market.market_index.to_le_bytes();
+    let seeds = &[
+        b"market".as_ref(),
+        market_index_bytes.as_ref(),
+        &[market.bump],
+    ];
+    let signer_seeds = &[&seeds[..]];
+
+    // 5. CPI TRANSFER
+    let cpi_accounts = TransferChecked {
+        from: ctx.accounts.market_vault.to_account_info(),
+        to: ctx.accounts.creator_vault.to_account_info(),
+        authority: market.to_account_info(),
+        mint: ctx.accounts.mint.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.token_program.key(),
+        cpi_accounts,
+        signer_seeds,
+    );
+
+    anchor_spl::token_interface::transfer_checked(
+        cpi_ctx,
+        total_withdrawal,
+        ctx.accounts.mint.decimals,
+    )?;
+
+    msg!("Creator successfully withdrew {} tokens (Bond + LP Fees)!", total_withdrawal);
+
+    Ok(())
+}
+
+pub fn void_market_handler(ctx: Context<VoidMarket>) -> Result<()> {
+    let cyper_market = &ctx.accounts.cyper_market;
+    let market = &mut ctx.accounts.market;
+
+    require_keys_eq!(ctx.accounts.authority.key(), cyper_market.authority, ErrorCode::UnauthorizedAction);
+    
+    market.status = MarketStatus::Voided;
+    msg!("Market {} has been voided by protocol authority. Refunds enabled.", market.market_index);
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct WithdrawCreator<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"market", market.market_index.to_le_bytes().as_ref()],
+        bump = market.bump,
+        has_one = creator @ ErrorCode::UnauthorizedAction
+    )]
+    pub market: Box<Account<'info, Market>>,
+
+    #[account(address = market.token_mint @ ErrorCode::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = market,
+        associated_token::token_program = token_program
+    )]
+    pub market_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = creator,
+        associated_token::mint = mint,
+        associated_token::authority = creator,
+        associated_token::token_program = token_program
+    )]
+    pub creator_vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct VoidMarket<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"protocol"],
+        bump = cyper_market.bump,
+    )]
+    pub cyper_market: Account<'info, CyperMarket>,
+
+    #[account(
+        mut,
+        seeds = [b"market", market.market_index.to_le_bytes().as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, Market>>,
+}
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
 pub enum MarketType {
